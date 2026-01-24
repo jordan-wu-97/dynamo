@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::h2_bidi_router::H2BidiRouter;
 use super::{AsyncEngineContextProvider, ResponseStream, STREAM_ERR_MSG};
 use crate::{
     component::{Client, Endpoint},
+    distributed::RequestPlaneMode,
     engine::{AsyncEngine, Data},
     pipeline::{
         AddressedPushRouter, AddressedRequest, Error, ManyOut, SingleIn,
@@ -37,6 +39,36 @@ pub trait WorkerLoadMonitor: Send + Sync {
     async fn start_monitoring(&self) -> anyhow::Result<()>;
 }
 
+/// Wrapper enum to support multiple addressed router implementations
+///
+/// This allows PushRouter to work with either:
+/// - Legacy two-connection model (AddressedPushRouter: request + TCP callback)
+/// - HTTP/2 bidirectional streaming (H2BidiRouter: single connection)
+#[derive(Clone)]
+pub(crate) enum AddressedRouterImpl {
+    /// Legacy two-connection model (request plane + TCP response callback)
+    Legacy(Arc<AddressedPushRouter>),
+    /// HTTP/2 bidirectional streaming (single connection for request and response)
+    H2Bidi(Arc<H2BidiRouter>),
+}
+
+impl AddressedRouterImpl {
+    /// Generate a response stream using the appropriate router implementation
+    pub async fn generate<T, U>(
+        &self,
+        request: SingleIn<AddressedRequest<T>>,
+    ) -> anyhow::Result<ManyOut<U>>
+    where
+        T: Data + Serialize,
+        U: Data + for<'de> Deserialize<'de> + MaybeError,
+    {
+        match self {
+            Self::Legacy(router) => router.generate(request).await,
+            Self::H2Bidi(router) => router.generate(request).await,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PushRouter<T, U>
 where
@@ -59,8 +91,9 @@ where
     round_robin_counter: Arc<AtomicU64>,
 
     /// The next step in the chain. PushRouter (this object) picks an instances,
-    /// addresses it, then passes it to AddressedPushRouter which does the network traffic.
-    addressed: Arc<AddressedPushRouter>,
+    /// addresses it, then passes it to the addressed router which does the network traffic.
+    /// This can be either AddressedPushRouter (legacy) or H2BidiRouter.
+    addressed: AddressedRouterImpl,
 
     /// Threshold for determining when a worker is busy (0.0 to 1.0)
     /// If None, busy detection is disabled
@@ -88,18 +121,31 @@ impl RouterMode {
     }
 }
 
-async fn addressed_router(endpoint: &Endpoint) -> anyhow::Result<Arc<AddressedPushRouter>> {
+/// Create a legacy addressed router (two-connection model)
+async fn addressed_router(request_plane_mode: RequestPlaneMode, endpoint: &Endpoint) -> anyhow::Result<AddressedRouterImpl> {
     // Get network manager and create client (no mode checks!)
     let manager = endpoint.drt().network_manager();
-    let req_client = manager.create_client()?;
-    let resp_transport = endpoint.drt().tcp_server().await?;
 
-    tracing::debug!(
-        transport = req_client.transport_name(),
-        "Creating AddressedPushRouter with request plane client"
-    );
+    match request_plane_mode {
+        RequestPlaneMode::H2Bidi => {
+            let router = manager.create_h2bidi_router()?;
+            tracing::debug!("Creating H2BidiRouter for bidirectional streaming");
+            Ok(AddressedRouterImpl::H2Bidi(router))
+        }
+        _ => {
+            let req_client = manager.create_client()?;
+            let resp_transport = endpoint.drt().tcp_server().await?;
+            tracing::debug!(
+                transport = req_client.transport_name(),
+                "Creating AddressedPushRouter with request plane client"
+            );
+            let router = AddressedPushRouter::new(req_client, resp_transport)?;
+            Ok(AddressedRouterImpl::Legacy(router))
+        }
 
-    AddressedPushRouter::new(req_client, resp_transport)
+    }
+
+    
 }
 
 impl<T, U> PushRouter<T, U>
@@ -119,7 +165,9 @@ where
         busy_threshold: Option<f64>,
         worker_monitor: Option<Arc<dyn WorkerLoadMonitor>>,
     ) -> anyhow::Result<Self> {
-        let addressed = addressed_router(&client.endpoint).await?;
+        // Check if H2Bidi mode is enabled
+        let request_plane = client.endpoint.drt().request_plane();
+        let addressed = addressed_router(request_plane, &client.endpoint).await?;
 
         // Start worker monitor if provided and in dynamic mode
         if let Some(monitor) = worker_monitor.as_ref() {
@@ -132,6 +180,25 @@ where
             router_mode,
             round_robin_counter: Arc::new(AtomicU64::new(0)),
             busy_threshold,
+            _phantom: PhantomData,
+        };
+
+        Ok(router)
+    }
+
+    /// Create a new PushRouter using H2Bidi transport (single HTTP/2 connection)
+    ///
+    /// This bypasses the legacy two-connection model and uses HTTP/2 bidirectional
+    /// streaming for both request and response on the same connection.
+    pub fn from_client_h2bidi(client: Client, router_mode: RouterMode) -> anyhow::Result<Self> {
+        let addressed = addressed_router_h2bidi(&client.endpoint)?;
+
+        let router = PushRouter {
+            client: client.clone(),
+            addressed,
+            router_mode,
+            round_robin_counter: Arc::new(AtomicU64::new(0)),
+            busy_threshold: None,
             _phantom: PhantomData,
         };
 

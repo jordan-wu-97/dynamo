@@ -278,6 +278,24 @@ fn build_transport_type_inner(
             endpoint_id,
             connection_id,
         ))),
+        RequestPlaneMode::H2Bidi => {
+            // H2Bidi uses HTTP transport type since the worker listens on HTTP
+            // for bidirectional streaming (request and response on same connection)
+            let http_host = crate::utils::get_http_rpc_host_from_env();
+            let http_port = std::env::var("DYN_HTTP_RPC_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(8888);
+            let rpc_root =
+                std::env::var("DYN_HTTP_RPC_ROOT_PATH").unwrap_or_else(|_| "/v1/rpc".to_string());
+
+            let http_endpoint = format!(
+                "http://{http_host}:{http_port}{rpc_root}/{}",
+                endpoint_id.name
+            );
+
+            Ok(TransportType::Http(http_endpoint))
+        }
     }
 }
 

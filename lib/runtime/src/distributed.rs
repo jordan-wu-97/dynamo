@@ -606,6 +606,7 @@ impl DistributedConfig {
 /// - `Nats`: Use NATS for request distribution (legacy)
 /// - `Http`: Use HTTP/2 for request distribution
 /// - `Tcp`: Use raw TCP for request distribution with msgpack support (default)
+/// - `H2Bidi`: Use HTTP/2 bidirectional streaming (single connection for request and response)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestPlaneMode {
     /// Use NATS for request plane
@@ -614,6 +615,8 @@ pub enum RequestPlaneMode {
     Http,
     /// Use raw TCP for request plane with msgpack support
     Tcp,
+    /// Use HTTP/2 bidirectional streaming (single connection for request and response)
+    H2Bidi,
 }
 
 impl Default for RequestPlaneMode {
@@ -628,6 +631,7 @@ impl fmt::Display for RequestPlaneMode {
             Self::Nats => write!(f, "nats"),
             Self::Http => write!(f, "http"),
             Self::Tcp => write!(f, "tcp"),
+            Self::H2Bidi => write!(f, "h2bidi"),
         }
     }
 }
@@ -640,8 +644,9 @@ impl std::str::FromStr for RequestPlaneMode {
             "nats" => Ok(Self::Nats),
             "http" => Ok(Self::Http),
             "tcp" => Ok(Self::Tcp),
+            "h2bidi" | "h2-bidi" => Ok(Self::H2Bidi),
             _ => Err(anyhow::anyhow!(
-                "Invalid request plane mode: '{}'. Valid options are: 'nats', 'http', 'tcp'",
+                "Invalid request plane mode: '{}'. Valid options are: 'nats', 'http', 'tcp', 'h2bidi'",
                 s
             )),
         }
@@ -777,6 +782,14 @@ mod tests {
             RequestPlaneMode::Tcp
         );
         assert_eq!(
+            "h2bidi".parse::<RequestPlaneMode>().unwrap(),
+            RequestPlaneMode::H2Bidi
+        );
+        assert_eq!(
+            "h2-bidi".parse::<RequestPlaneMode>().unwrap(),
+            RequestPlaneMode::H2Bidi
+        );
+        assert_eq!(
             "NATS".parse::<RequestPlaneMode>().unwrap(),
             RequestPlaneMode::Nats
         );
@@ -788,6 +801,10 @@ mod tests {
             "TCP".parse::<RequestPlaneMode>().unwrap(),
             RequestPlaneMode::Tcp
         );
+        assert_eq!(
+            "H2BIDI".parse::<RequestPlaneMode>().unwrap(),
+            RequestPlaneMode::H2Bidi
+        );
         assert!("invalid".parse::<RequestPlaneMode>().is_err());
     }
 
@@ -796,5 +813,6 @@ mod tests {
         assert_eq!(RequestPlaneMode::Nats.to_string(), "nats");
         assert_eq!(RequestPlaneMode::Http.to_string(), "http");
         assert_eq!(RequestPlaneMode::Tcp.to_string(), "tcp");
+        assert_eq!(RequestPlaneMode::H2Bidi.to_string(), "h2bidi");
     }
 }

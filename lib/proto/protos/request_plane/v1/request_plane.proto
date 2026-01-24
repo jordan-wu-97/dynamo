@@ -355,8 +355,8 @@ message LLMEngineOutput {
   optional CompletionUsage completion_usage = 13;
 }
 
-// Service for LLM inference operations
-service LLMEngine {
+// Describe the RPC for a backend worker
+service BackendWorker {
   // Generate tokens from a preprocessed request, streaming output tokens
   rpc Generate(PreprocessedRequest) returns (stream LLMEngineOutput);
 }

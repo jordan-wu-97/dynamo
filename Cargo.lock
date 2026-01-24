@@ -2315,6 +2315,7 @@ dependencies = [
  "dynamo-async-openai",
  "dynamo-memory",
  "dynamo-parsers",
+ "dynamo-proto",
  "dynamo-runtime",
  "either",
  "erased-serde",

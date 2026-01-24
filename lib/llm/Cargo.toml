@@ -27,6 +27,7 @@ cuda = ["dep:cudarc"]
 integration = ["dynamo-runtime/integration"]
 media-nixl = ["dep:nixl-sys", "dep:dynamo-memory"]
 media-ffmpeg = ["dep:video-rs", "dep:ffmpeg-next", "dep:memfile", "media-nixl"]
+#proto = ["dep:dynamo-proto"]
 
 [[bench]]
 name = "tokenizer"
@@ -106,6 +107,9 @@ aligned-vec = { version = "0.6.4", optional = true }
 nixl-sys = { version = "=0.8.0", optional = true }
 cudarc = { workspace = true, optional = true }
 nix = { version = "0.26", optional = true }
+
+# proto conversions
+dynamo-proto = { path = "../proto" }
 
 # block_manager_bench
 clap = { version = "4.5.49", features = ["derive"], optional = true }

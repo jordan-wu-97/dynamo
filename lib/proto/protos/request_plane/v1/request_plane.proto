@@ -1,0 +1,261 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package dynamo.request_plane.v1;
+
+import "google/protobuf/struct.proto";
+
+// Routing hints for directing requests to specific workers.
+// These fields are extracted from nvext and used by the router to determine
+// which worker(s) should handle the request.
+message RoutingHints {
+  // General backend instance ID for direct routing (aggregated mode)
+  optional uint64 backend_instance_id = 1;
+
+  // Targeted prefill worker ID for disaggregated serving (GAIE Stage 2)
+  optional uint64 prefill_worker_id = 2;
+
+  // Targeted decode worker ID for disaggregated serving (GAIE Stage 2)
+  optional uint64 decode_worker_id = 3;
+
+  // Data parallel rank for the request
+  optional uint32 dp_rank = 4;
+
+  // Controls whether the router should manage local bookkeeping (add_request,
+  // mark_prefill_completed, free) for this request.
+  // - Not set or true: Router handles bookkeeping locally (default behavior)
+  // - false: External caller (e.g., GAIE sidecar) handles bookkeeping via C FFI
+  optional bool enable_local_updates = 5;
+
+  // Expected number of output tokens for this request.
+  // Used as a hint for routing decisions to estimate resource requirements.
+  optional uint32 expected_output_tokens = 6;
+}
+
+// Bootstrap information for disaggregated serving
+message BootstrapInfo {
+  // The host address for bootstrap connection
+  string bootstrap_host = 1;
+
+  // The port for bootstrap connection
+  uint32 bootstrap_port = 2;
+
+  // Unique room ID for this request's KV transfer session
+  uint64 bootstrap_room = 3;
+}
+
+// Prompt token details produced during prefill
+message PromptTokensDetails {
+  // Number of cached tokens
+  optional uint32 cached_tokens = 1;
+
+  // Number of audio tokens
+  optional uint32 audio_tokens = 2;
+}
+
+// Structured prefill result
+message PrefillResult {
+  // Disaggregated execution parameters (JSON serialized)
+  google.protobuf.Struct disaggregated_params = 1;
+
+  // Prompt token details produced during prefill
+  optional PromptTokensDetails prompt_tokens_details = 2;
+}
+
+// Multimodal data - either a URL or RDMA descriptor
+message MultimodalData {
+  oneof data {
+    // URL reference to multimodal content
+    string url = 1;
+
+    // RDMA media data descriptor (serialized)
+    bytes rdma_descriptor = 2;
+  }
+}
+
+// Multimodal data entry for a specific media type
+message MultimodalDataEntry {
+  // Media type key (e.g., "image", "audio")
+  string media_type = 1;
+
+  // List of multimodal data items for this type
+  repeated MultimodalData items = 2;
+}
+
+// Stop conditions for the inference engine
+message StopConditions {
+  // The maximum number of tokens to generate
+  optional uint32 max_tokens = 1;
+
+  // List of strings that stop generation when they are generated.
+  // The returned output will not contain the stop strings.
+  repeated string stop = 2;
+
+  // List of tokens that stop generation when they are generated.
+  // The returned output will NOT contain the stop tokens.
+  repeated uint32 stop_token_ids_hidden = 3;
+
+  // The minimum number of tokens to generate
+  // To ignore_eos, set min_tokens to max_tokens
+  optional uint32 min_tokens = 4;
+
+  // Whether to ignore the EOS token and continue generating
+  // tokens after the EOS token is generated.
+  optional bool ignore_eos = 5;
+
+  // Maximum number of thinking tokens allowed
+  optional uint32 max_thinking_tokens = 6;
+}
+
+// Guided decoding options
+// Only one of json, regex, choice, or grammar should be set.
+message GuidedDecodingOptions {
+  // If specified, the output will follow the JSON schema
+  optional google.protobuf.Struct json = 1;
+
+  // If specified, the output will follow the regex pattern
+  optional string regex = 2;
+
+  // If specified, the output will be exactly one of the choices
+  repeated string choice = 3;
+
+  // If specified, the output will follow the context-free grammar
+  optional string grammar = 4;
+
+  // If specified, the backend to use for guided decoding
+  optional string backend = 5;
+
+  // If specified, whitespace pattern to use for guided decoding
+  optional string whitespace_pattern = 6;
+}
+
+// Collection of options that control the sampling behavior of the inference engine
+message SamplingOptions {
+  // Number of output sequences to return for the given prompt
+  optional uint32 n = 1;
+
+  // Number of output sequences that are generated from the prompt.
+  // From these `best_of` sequences, the top `n` sequences are returned.
+  optional uint32 best_of = 2;
+
+  // Float that penalizes new tokens based on whether they
+  // appear in the generated text so far.
+  optional float presence_penalty = 3;
+
+  // Float that penalizes new tokens based on their
+  // frequency in the generated text so far.
+  optional float frequency_penalty = 4;
+
+  // Float that penalizes new tokens based on whether
+  // they appear in the prompt and the generated text so far.
+  optional float repetition_penalty = 5;
+
+  // Float that controls the randomness of the sampling.
+  // Lower values make the model more deterministic.
+  // Zero means greedy sampling.
+  optional float temperature = 6;
+
+  // Float that controls the cumulative probability of the top tokens
+  // to consider. Must be in (0, 1]. Set to 1 to consider all tokens.
+  optional float top_p = 7;
+
+  // Integer that controls the number of top tokens to consider.
+  // Set to -1 to consider all tokens.
+  optional int32 top_k = 8;
+
+  // Float that represents the minimum probability for a token to be
+  // considered, relative to the probability of the most likely token.
+  optional float min_p = 9;
+
+  // Whether to use beam search instead of sampling
+  optional bool use_beam_search = 10;
+
+  // Float that penalizes sequences based on their length.
+  // Used in beam search.
+  optional float length_penalty = 11;
+
+  // The seed to use when sampling
+  optional int64 seed = 12;
+
+  // Whether to include the stop string in the output
+  optional bool include_stop_str_in_output = 13;
+
+  // Guided decoding options
+  optional GuidedDecodingOptions guided_decoding = 14;
+}
+
+// Collection of options that control what information the inference engine returns
+message OutputOptions {
+  // Number of log probabilities to return per output token
+  optional uint32 logprobs = 1;
+
+  // Number of log probabilities to return per prompt token
+  optional uint32 prompt_logprobs = 2;
+
+  // Whether to skip special tokens in the output
+  optional bool skip_special_tokens = 3;
+
+  // If true, the Context object will contain the prompt that was passed to
+  // the tokenizer (useful for inspecting prompt template behavior)
+  optional bool formatted_prompt = 4;
+}
+
+// Override configuration for router settings that can be specified per-request
+message RouterConfigOverride {
+  optional double overlap_score_weight = 1;
+
+  optional double router_temperature = 2;
+}
+
+// PreprocessedRequest is the internal representation of an LLM request.
+// The dynamo.llm-preprocessor crate is responsible for converting requests
+// from the public APIs to this internal representation.
+message PreprocessedRequest {
+  // ID of the model to use
+  string model = 1;
+
+  // Tokenized prompt as token IDs
+  repeated uint32 token_ids = 2;
+
+  // Base64-encoded PyTorch tensor containing pre-computed embeddings
+  // If provided, this takes precedence over token_ids for inference
+  optional string prompt_embeds = 3;
+
+  // Multimodal data map containing {mm_part_type: [data...]}
+  repeated MultimodalDataEntry multi_modal_data = 4;
+
+  // StopConditions are conditions that the inference engine will use to stop generation
+  StopConditions stop_conditions = 5;
+
+  // SamplingOptions directs the inference engine to use sampling instead of greedy decoding
+  SamplingOptions sampling_options = 6;
+
+  // OutputOptions are options that control the output of the inference engine
+  OutputOptions output_options = 7;
+
+  // The EOS token ID(s) for the Model
+  repeated uint32 eos_token_ids = 8;
+
+  // The computed checksum of the Model Deployment Card (MDC)
+  optional string mdc_sum = 9;
+
+  // User requested annotations for the request
+  repeated string annotations = 10;
+
+  // Routing hints for worker targeting (backend_instance_id, prefill/decode worker IDs, dp_rank)
+  optional RoutingHints routing = 11;
+
+  // Router configuration overrides for this specific request
+  optional RouterConfigOverride router_config_override = 12;
+
+  // Structured prefill result
+  optional PrefillResult prefill_result = 13;
+
+  // Bootstrap info for disaggregated serving
+  optional BootstrapInfo bootstrap_info = 14;
+
+  // Additional arguments for extensibility (JSON serialized)
+  optional google.protobuf.Struct extra_args = 15;
+}

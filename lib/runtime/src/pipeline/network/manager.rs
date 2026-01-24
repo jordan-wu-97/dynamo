@@ -38,6 +38,34 @@ static ACTUAL_TCP_RPC_PORT: OnceLock<u16> = OnceLock::new();
 static GLOBAL_TCP_SERVER: tokio::sync::OnceCell<Arc<SharedTcpServer>> =
     tokio::sync::OnceCell::const_new();
 
+/// Global storage for the actual H2Bidi RPC port after binding.
+static ACTUAL_H2BIDI_RPC_PORT: OnceLock<u16> = OnceLock::new();
+
+/// Global storage for the shared H2Bidi server instance.
+static GLOBAL_H2BIDI_SERVER: tokio::sync::OnceCell<Arc<super::ingress::h2_bidi_endpoint::H2BidiServer>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Get the actual H2Bidi RPC port that the server is listening on.
+pub fn get_actual_h2bidi_rpc_port() -> anyhow::Result<u16> {
+    ACTUAL_H2BIDI_RPC_PORT.get().copied().ok_or_else(|| {
+        tracing::error!(
+            "H2Bidi RPC port not set - request_plane_server() must be called before get_actual_h2bidi_rpc_port()"
+        );
+        anyhow::anyhow!("H2Bidi RPC port not initialized. This is not expected.")
+    })
+}
+
+/// Set the actual H2Bidi RPC port (called internally after server binds).
+fn set_actual_h2bidi_rpc_port(port: u16) {
+    if let Err(existing) = ACTUAL_H2BIDI_RPC_PORT.set(port) {
+        tracing::warn!(
+            existing_port = existing,
+            new_port = port,
+            "H2Bidi RPC port already set, ignoring new value"
+        );
+    }
+}
+
 /// Get the actual TCP RPC port that the server is listening on.
 pub fn get_actual_tcp_rpc_port() -> anyhow::Result<u16> {
     ACTUAL_TCP_RPC_PORT.get().copied().ok_or_else(|| {
@@ -74,11 +102,19 @@ struct NetworkConfig {
     /// TCP port to bind to. If None, the OS will assign a free port.
     tcp_port: Option<u16>,
 
+    // H2Bidi server configuration
+    h2bidi_host: String,
+    /// H2Bidi port to bind to. If None, the OS will assign a free port.
+    h2bidi_port: Option<u16>,
+
     // HTTP client configuration
     http_client_config: super::egress::http_router::Http2Config,
 
     // TCP client configuration
     tcp_client_config: super::egress::tcp_client::TcpRequestConfig,
+
+    // H2Bidi client configuration
+    h2bidi_client_config: super::egress::h2_bidi_client::H2BidiConfig,
 
     // NATS configuration (provided externally, not from env)
     nats_client: Option<async_nats::Client>,
@@ -108,11 +144,21 @@ impl NetworkConfig {
                 .ok()
                 .and_then(|p| p.parse().ok()),
 
+            // H2Bidi server configuration
+            h2bidi_host: std::env::var("DYN_H2BIDI_RPC_HOST")
+                .unwrap_or_else(|_| crate::utils::get_http_rpc_host_from_env()),
+            h2bidi_port: std::env::var("DYN_H2BIDI_RPC_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok()),
+
             // HTTP client configuration (reads DYN_HTTP2_* env vars)
             http_client_config: super::egress::http_router::Http2Config::from_env(),
 
             // TCP client configuration (reads DYN_TCP_* env vars)
             tcp_client_config: super::egress::tcp_client::TcpRequestConfig::from_env(),
+
+            // H2Bidi client configuration
+            h2bidi_client_config: super::egress::h2_bidi_client::H2BidiConfig::from_env(),
 
             // NATS (external)
             nats_client,
@@ -209,6 +255,18 @@ impl NetworkManager {
                     "Initializing NetworkManager with NATS request plane"
                 );
             }
+            RequestPlaneMode::H2Bidi => {
+                let port_display = config
+                    .h2bidi_port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "OS-assigned".to_string());
+                tracing::info!(
+                    %mode,
+                    host = %config.h2bidi_host,
+                    port = %port_display,
+                    "Initializing NetworkManager with H2Bidi request plane"
+                );
+            }
         }
 
         Self {
@@ -262,6 +320,13 @@ impl NetworkManager {
             RequestPlaneMode::Http => self.create_http_client(),
             RequestPlaneMode::Tcp => self.create_tcp_client(),
             RequestPlaneMode::Nats => self.create_nats_client(),
+            RequestPlaneMode::H2Bidi => {
+                // H2Bidi mode uses a different client interface (H2BidiStreamingClient)
+                // that returns a streaming response. For the unified RequestPlaneClient
+                // interface, we return the HTTP client since H2Bidi uses HTTP/2 transport.
+                // The actual streaming client is used by H2BidiRouter directly.
+                self.create_http_client()
+            }
         }
     }
 
@@ -282,6 +347,7 @@ impl NetworkManager {
             RequestPlaneMode::Http => self.create_http_server().await,
             RequestPlaneMode::Tcp => self.create_tcp_server().await,
             RequestPlaneMode::Nats => self.create_nats_server().await,
+            RequestPlaneMode::H2Bidi => self.create_h2bidi_server().await,
         }
     }
 
@@ -365,6 +431,46 @@ impl NetworkManager {
             self.component_registry.clone(),
             self.cancellation_token.clone(),
         ) as Arc<dyn RequestPlaneServer>)
+    }
+
+    async fn create_h2bidi_server(&self) -> Result<Arc<dyn RequestPlaneServer>> {
+        use super::ingress::h2_bidi_endpoint::H2BidiServer;
+
+        // Use the global H2Bidi server to ensure all workers in the same process share
+        // a single server.
+        let server = GLOBAL_H2BIDI_SERVER
+            .get_or_try_init(|| async {
+                // Use configured port if specified, otherwise use port 0 (OS assigns free port)
+                let port = self.config.h2bidi_port.unwrap_or(0);
+                let bind_addr = format!("{}:{}", self.config.h2bidi_host, port)
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("Invalid H2Bidi bind address: {}", e))?;
+
+                tracing::info!(
+                    bind_addr = %bind_addr,
+                    port_source = if self.config.h2bidi_port.is_some() { "DYN_H2BIDI_RPC_PORT" } else { "OS-assigned" },
+                    "Creating H2Bidi request plane server"
+                );
+
+                let server = H2BidiServer::new(bind_addr, self.cancellation_token.clone());
+
+                // Bind and start server, getting the actual bound address
+                let actual_addr = server.clone().bind_and_start().await?;
+
+                // Store the actual bound port globally
+                set_actual_h2bidi_rpc_port(actual_addr.port());
+
+                tracing::info!(
+                    actual_addr = %actual_addr,
+                    actual_port = actual_addr.port(),
+                    "H2Bidi request plane server started"
+                );
+
+                Ok::<_, anyhow::Error>(server)
+            })
+            .await?;
+
+        Ok(server.clone() as Arc<dyn RequestPlaneServer>)
     }
 
     // ============================================================================

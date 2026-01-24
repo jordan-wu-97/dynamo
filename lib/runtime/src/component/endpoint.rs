@@ -278,6 +278,24 @@ fn build_transport_type_inner(
             endpoint_id,
             connection_id,
         ))),
+        RequestPlaneMode::H2Bidi => {
+            let h2bidi_host = crate::utils::get_http_rpc_host_from_env();
+            // If a fixed port is explicitly configured, use it directly.
+            // Otherwise, use the actual bound port (set by H2Bidi server after binding when port 0 is used).
+            let h2bidi_port = std::env::var("DYN_H2BIDI_RPC_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(crate::pipeline::network::manager::get_actual_h2bidi_rpc_port()?);
+            let rpc_root = std::env::var("DYN_H2BIDI_RPC_ROOT_PATH")
+                .unwrap_or_else(|_| "/v1/rpc/bidi".to_string());
+
+            let h2bidi_endpoint = format!(
+                "http://{h2bidi_host}:{h2bidi_port}{rpc_root}/{}",
+                endpoint_id.name
+            );
+
+            Ok(TransportType::Http(h2bidi_endpoint))
+        }
     }
 }
 

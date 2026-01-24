@@ -209,6 +209,12 @@ impl NetworkManager {
                     "Initializing NetworkManager with NATS request plane"
                 );
             }
+            RequestPlaneMode::H2Bidi => {
+                tracing::info!(
+                    %mode,
+                    "Initializing NetworkManager with H2Bidi request plane (HTTP/2 bidirectional streaming)"
+                );
+            }
         }
 
         Self {
@@ -262,7 +268,35 @@ impl NetworkManager {
             RequestPlaneMode::Http => self.create_http_client(),
             RequestPlaneMode::Tcp => self.create_tcp_client(),
             RequestPlaneMode::Nats => self.create_nats_client(),
+            RequestPlaneMode::H2Bidi => {
+                // H2Bidi doesn't use RequestPlaneClient interface since it handles
+                // both request and response on the same connection. The H2BidiRouter
+                // should be created via create_h2bidi_router() instead.
+                // For compatibility, we return an HTTP client that won't be used.
+                panic!(
+                    "create_client() called in H2Bidi mode - use create_h2bidi_router() instead"
+                );
+            }
         }
+    }
+
+    /// Create an H2Bidi router for bidirectional HTTP/2 streaming
+    ///
+    /// This router handles both request and response on a single HTTP/2 connection,
+    /// eliminating the need for a separate TCP callback server.
+    ///
+    /// # Returns
+    ///
+    /// Returns an Arc-wrapped H2BidiRouter that implements AsyncEngine.
+    pub fn create_h2bidi_router(
+        &self,
+    ) -> Result<Arc<super::egress::h2_bidi_router::H2BidiRouter>> {
+        use super::egress::h2_bidi_client::H2BidiClient;
+        use super::egress::h2_bidi_router::H2BidiRouter;
+
+        tracing::debug!("Creating H2Bidi router for bidirectional streaming");
+        let client = Arc::new(H2BidiClient::from_env()?);
+        Ok(Arc::new(H2BidiRouter::new(client)))
     }
 
     /// Get the current request plane mode
@@ -282,6 +316,13 @@ impl NetworkManager {
             RequestPlaneMode::Http => self.create_http_server().await,
             RequestPlaneMode::Tcp => self.create_tcp_server().await,
             RequestPlaneMode::Nats => self.create_nats_server().await,
+            RequestPlaneMode::H2Bidi => {
+                // H2Bidi mode on the router side doesn't need a request plane server
+                // since responses come back on the same HTTP/2 connection.
+                // For compatibility, we create an HTTP server that won't be used for responses.
+                tracing::info!("H2Bidi mode: creating HTTP server for incoming requests");
+                self.create_http_server().await
+            }
         }
     }
 

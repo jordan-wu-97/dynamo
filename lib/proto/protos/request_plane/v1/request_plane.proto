@@ -259,3 +259,104 @@ message PreprocessedRequest {
   // Additional arguments for extensibility (JSON serialized)
   optional google.protobuf.Struct extra_args = 15;
 }
+
+// Finish reason for generation completion
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_EOS = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_STOP = 3;
+  FINISH_REASON_ERROR = 4;
+  FINISH_REASON_CANCELLED = 5;
+  FINISH_REASON_CONTENT_FILTER = 6;
+}
+
+// Stop reason - either a matched stop string or a stop token ID
+message StopReason {
+  oneof reason {
+    // Matched user-provided stop sequence
+    string stop_string = 1;
+    // Matched stop token ID
+    int64 stop_token_id = 2;
+  }
+}
+
+// Top log probability for a single token
+message TopLogprob {
+  // Rank of this token among all possible tokens
+  uint32 rank = 1;
+  // The token ID
+  uint32 token_id = 2;
+  // The decoded token string (optional, may be None for special tokens)
+  optional string token = 3;
+  // Log probability of this token
+  double logprob = 4;
+}
+
+// Top log probabilities for a single position
+message TopLogprobsEntry {
+  // List of top log probabilities at this position
+  repeated TopLogprob top_logprobs = 1;
+}
+
+// Completion tokens details produced during generation
+message CompletionTokensDetails {
+  // Number of accepted prediction tokens
+  optional uint32 accepted_prediction_tokens = 1;
+  // Number of audio tokens
+  optional uint32 audio_tokens = 2;
+  // Number of reasoning tokens
+  optional uint32 reasoning_tokens = 3;
+  // Number of rejected prediction tokens
+  optional uint32 rejected_prediction_tokens = 4;
+}
+
+// Usage statistics for the completion
+message CompletionUsage {
+  // Number of tokens in the prompt
+  uint32 prompt_tokens = 1;
+  // Number of tokens in the completion
+  uint32 completion_tokens = 2;
+  // Total number of tokens (prompt + completion)
+  uint32 total_tokens = 3;
+  // Details about prompt tokens
+  optional PromptTokensDetails prompt_tokens_details = 4;
+  // Details about completion tokens
+  optional CompletionTokensDetails completion_tokens_details = 5;
+}
+
+// Output from the LLM engine for a single generation step or completion
+message LLMEngineOutput {
+  // Generated token IDs
+  repeated uint32 token_ids = 1;
+  // Decoded tokens (optional, may contain None for special tokens)
+  repeated string tokens = 2;
+  // Decoded text (concatenated tokens)
+  optional string text = 3;
+  // Cumulative log probability
+  optional double cum_log_probs = 4;
+  // Log probabilities for each generated token
+  repeated double log_probs = 5;
+  // Top log probabilities for each position (num_tokens x top_k)
+  repeated TopLogprobsEntry top_logprobs = 6;
+  // Reason for finishing generation
+  optional FinishReason finish_reason = 7;
+  // Error message if finish_reason is ERROR
+  optional string finish_reason_error = 8;
+  // Stop reason (what triggered the stop)
+  optional StopReason stop_reason = 9;
+  // Index of this output in the batch
+  optional uint32 index = 10;
+  // Disaggregated execution parameters (JSON serialized)
+  optional google.protobuf.Struct disaggregated_params = 11;
+  // Additional arguments for extensibility (JSON serialized)
+  optional google.protobuf.Struct extra_args = 12;
+  // Usage statistics
+  optional CompletionUsage completion_usage = 13;
+}
+
+// Service for LLM inference operations
+service LLMEngine {
+  // Generate tokens from a preprocessed request, streaming output tokens
+  rpc Generate(PreprocessedRequest) returns (stream LLMEngineOutput);
+}

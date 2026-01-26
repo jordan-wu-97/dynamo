@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "tcp_codec_perf"
 harness = false
+
+[[bench]]
+name = "http_response_mode"
+harness = false

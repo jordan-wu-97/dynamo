@@ -190,6 +190,14 @@ pub struct StreamReceiver {
     rx: tokio::sync::mpsc::Receiver<Bytes>,
 }
 
+impl StreamReceiver {
+    /// Receive the next message from the stream.
+    /// Returns `None` if the stream has been closed.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.rx.recv().await
+    }
+}
+
 /// Connection Info is encoded as JSON and then again serialized has part of the Transport
 /// Layer. The double serialization is not performance critical as it is only done once per
 /// connection. The primary reason storing the ConnecitonInfo has a JSON string is for type

@@ -27,19 +27,22 @@ use dynamo_runtime::{
         network::{
             ConnectionInfo, NetworkStreamWrapper, ResponseService, StreamOptions,
             codec::{TwoPartCodec, TwoPartMessage},
+            egress::{
+                http_router::HttpRequestClient,
+                unified_client::{RequestPlaneClient, RequestResponseChannel},
+            },
             tcp::{TcpStreamConnectionInfo, client::TcpClient, server::TcpStreamServer},
         },
     },
 };
 use futures::StreamExt;
-use tokio_util::codec::{FramedRead, LinesCodec};
-use tokio_util::io::StreamReader;
 use hyper_util::{
     rt::TokioExecutor,
     server::conn::auto::Builder as ConnBuilder,
     service::TowerToHyperService,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -352,9 +355,9 @@ async fn start_bidi_worker() -> (String, tokio::task::JoinHandle<()>) {
     (worker_url, handle)
 }
 
-/// Run a single TCP callback benchmark iteration
+/// Run a single TCP callback benchmark iteration using HttpRequestClient
 async fn run_tcp_callback_iteration(
-    client: &reqwest::Client,
+    client: &HttpRequestClient,
     worker_url: &str,
     tcp_server: &Arc<TcpStreamServer>,
     request: &BenchRequest,
@@ -383,68 +386,70 @@ async fn run_tcp_callback_iteration(
     let codec = TwoPartCodec::default();
     let payload = codec.encode_message(msg).unwrap();
 
-    // Send request to worker
-    let _response = client.post(worker_url).body(payload).send().await.unwrap();
+    // Send request to worker using HttpRequestClient
+    let response = client
+        .send_request(worker_url.to_string(), payload, HashMap::new())
+        .await
+        .unwrap();
 
-    // Wait for TCP callback connection and receive responses
-    let mut recv_stream = recv_stream_reg.stream_provider.await.unwrap().unwrap();
-    let mut count = 0;
+    // Should get TcpCallback response (worker doesn't support bidi)
+    match response {
+        RequestResponseChannel::TcpCallback(_) => {
+            // Wait for TCP callback connection and receive responses
+            let mut recv_stream = recv_stream_reg.stream_provider.await.unwrap().unwrap();
+            let mut count = 0;
 
-    while let Some(data) = recv_stream.recv().await {
-        let wrapper: NetworkStreamWrapper<BenchResponse> = serde_json::from_slice(&data).unwrap();
-        if wrapper.complete_final {
-            break;
+            while let Some(data) = recv_stream.recv().await {
+                let wrapper: NetworkStreamWrapper<BenchResponse> =
+                    serde_json::from_slice(&data).unwrap();
+                if wrapper.complete_final {
+                    break;
+                }
+                count += 1;
+            }
+            count
         }
-        count += 1;
+        RequestResponseChannel::DirectResponse(_) => {
+            panic!("Expected TcpCallback but got DirectResponse");
+        }
     }
-
-    count
 }
 
-/// Run a single bidi benchmark iteration
+/// Run a single bidi benchmark iteration using HttpRequestClient
 async fn run_bidi_iteration(
-    client: &reqwest::Client,
+    client: &HttpRequestClient,
     worker_url: &str,
     request: &BenchRequest,
 ) -> usize {
     let request_bytes = serde_json::to_vec(&request).unwrap();
 
+    // Send request using HttpRequestClient (automatically adds bidi header)
     let response = client
-        .post(worker_url)
-        .header("x-dynamo-accept-bidi-stream", "true")
-        .body(request_bytes)
-        .send()
+        .send_request(worker_url.to_string(), request_bytes.into(), HashMap::new())
         .await
         .unwrap();
 
-    // Verify bidi response
-    assert!(response
-        .headers()
-        .get("x-dynamo-bidi-stream")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "true")
-        .unwrap_or(false));
-
-    let stream = response
-        .bytes_stream()
-        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-    let reader = StreamReader::new(stream);
-    let mut lines = FramedRead::new(reader, LinesCodec::new());
-    let mut count = 0;
-
-    while let Some(result) = lines.next().await {
-        let line = result.unwrap();
-        if !line.is_empty() {
-            let wrapper: NetworkStreamWrapper<BenchResponse> =
-                serde_json::from_str(&line).unwrap();
-            if wrapper.complete_final {
-                return count;
+    // Should get DirectResponse (bidi stream)
+    match response {
+        RequestResponseChannel::DirectResponse(mut stream) => {
+            let mut count = 0;
+            while let Some(result) = stream.next().await {
+                let bytes = result.unwrap();
+                if !bytes.is_empty() {
+                    let wrapper: NetworkStreamWrapper<BenchResponse> =
+                        serde_json::from_slice(&bytes).unwrap();
+                    if wrapper.complete_final {
+                        return count;
+                    }
+                    count += 1;
+                }
             }
-            count += 1;
+            count
+        }
+        RequestResponseChannel::TcpCallback(_) => {
+            panic!("Expected DirectResponse but got TcpCallback");
         }
     }
-
-    count
 }
 
 // ============================================================================
@@ -492,10 +497,7 @@ fn bench_response_size(c: &mut Criterion) {
             )
         });
 
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(10)
-        .build()
-        .unwrap();
+    let client = HttpRequestClient::new().unwrap();
 
     for &size in PAYLOAD_SIZES {
         let request = BenchRequest {
@@ -566,10 +568,7 @@ fn bench_stream_length(c: &mut Criterion) {
             )
         });
 
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(10)
-        .build()
-        .unwrap();
+    let client = HttpRequestClient::new().unwrap();
 
     for &count in STREAM_LENGTHS {
         let request = BenchRequest {
@@ -641,12 +640,7 @@ fn bench_concurrent_load(c: &mut Criterion) {
             )
         });
 
-    let client = Arc::new(
-        reqwest::Client::builder()
-            .pool_max_idle_per_host(200)
-            .build()
-            .unwrap(),
-    );
+    let client = Arc::new(HttpRequestClient::new().unwrap());
 
     for &concurrency in CONCURRENT_REQUESTS {
         let request = BenchRequest {

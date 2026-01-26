@@ -130,6 +130,26 @@ impl TcpStreamServer {
         ServerOptionsBuilder::default()
     }
 
+    /// Deregister a pending response stream by subject
+    ///
+    /// This is used when HTTP/2 bidi streaming is enabled and we no longer need
+    /// the TCP callback connection. Without explicit deregistration, entries would
+    /// leak since cleanup only happens when a TCP connection arrives.
+    pub async fn deregister_response_stream(&self, subject: &str) {
+        let mut state = self.state.lock().await;
+        if state.rx_subjects.remove(subject).is_some() {
+            tracing::debug!("Deregistered response stream for subject: {}", subject);
+        }
+    }
+
+    /// Deregister a pending request stream by subject
+    pub async fn deregister_request_stream(&self, subject: &str) {
+        let mut state = self.state.lock().await;
+        if state.tx_subjects.remove(subject).is_some() {
+            tracing::debug!("Deregistered request stream for subject: {}", subject);
+        }
+    }
+
     pub async fn new(options: ServerOptions) -> Result<Arc<Self>, PipelineError> {
         Self::new_with_resolver(options, DefaultIpResolver).await
     }

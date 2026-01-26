@@ -7,13 +7,30 @@
 //! in the request plane. All transport implementations (TCP, HTTP, NATS)
 //! implement this trait to provide a consistent interface for the egress router.
 
+use crate::engine::AsyncEngineContext;
+use crate::pipeline::network::tcp::TcpStreamConnectionInfo;
+use crate::pipeline::network::tcp::server::TcpStreamServer;
+use crate::pipeline::network::{PipelineError, RegisteredStream, StreamReceiver};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::Stream;
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Type alias for request headers
 pub type Headers = HashMap<String, String>;
+
+/// Stream of response bytes for bidirectional streaming
+pub type ResponseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
+
+pub enum RequestResponseChannel {
+    TCPCallback(Bytes),
+    HTTPResponseBody(ResponseByteStream),
+}
 
 /// Unified interface for request plane clients
 ///
@@ -76,7 +93,7 @@ pub trait RequestPlaneClient: Send + Sync {
         address: String,
         payload: Bytes,
         headers: Headers,
-    ) -> Result<Bytes>;
+    ) -> Result<RequestResponseChannel>;
 
     /// Get the transport name
     ///

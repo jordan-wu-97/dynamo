@@ -3,12 +3,19 @@
 
 //! HTTP/2 client for request plane
 
-use super::unified_client::{Headers, RequestPlaneClient};
+use super::unified_client::{Headers, RequestPlaneClient, ResponseByteStream, StreamContext};
 use crate::Result;
+use crate::pipeline::network::egress::unified_client::RequestResponseChannel;
+use anyhow::Error;
 use async_trait::async_trait;
+use axum::response::Response;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::io::StreamReader;
 
 /// Default timeout for HTTP requests (ack only, not full response)
 const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -152,6 +159,30 @@ impl HttpRequestClient {
     pub fn config(&self) -> &Http2Config {
         &self.config
     }
+
+    fn parse_ndjson_stream(http_response: reqwest::Response) -> ResponseByteStream {
+        // 1. Convert reqwest stream to a Stream<Item = io::Result<Bytes>>
+        // StreamReader requires the error type to be std::io::Error
+        let stream = http_response
+            .bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+        // 2. Convert the Stream into an AsyncRead
+        let reader = StreamReader::new(stream);
+
+        // 3. Wrap the reader in a FramedRead using LinesCodec
+        // This handles buffering and splitting by '\n' or '\r\n'
+        let framed = FramedRead::new(reader, LinesCodec::new());
+
+        // 4. Map the stream of Strings back to Result<Bytes>
+        // Note: LinesCodec strips the newline characters and validates UTF-8
+        let output_stream = framed.map(|item| match item {
+            Ok(line) => Ok(Bytes::from(line)),
+            Err(e) => Err(anyhow::Error::from(e)),
+        });
+
+        Box::pin(output_stream)
+    }
 }
 
 impl Default for HttpRequestClient {
@@ -167,7 +198,10 @@ impl RequestPlaneClient for HttpRequestClient {
         address: String,
         payload: Bytes,
         headers: Headers,
-    ) -> Result<Bytes> {
+    ) -> Result<RequestResponseChannel> {
+        // Signal to the server that we support bidi streaming
+        headers.insert("x-accept-bidi-stream".to_string(), "true".to_string());
+
         let mut req = self
             .client
             .post(&address)
@@ -189,8 +223,39 @@ impl RequestPlaneClient for HttpRequestClient {
             );
         }
 
-        let body = response.bytes().await?;
-        Ok(body)
+        // Check if server supports bidi streaming via response header
+        let is_bidi = response
+            .headers()
+            .get("x-bidi-stream")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        if is_bidi {
+            // check if the response is newline-delimited JSON
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            let is_nd_json = content_type.contains("application/x-ndjson");
+
+            if !is_nd_json {
+                return Err(anyhow::anyhow!(
+                    "backend responded with `x-bidi-stream: true` header but content-type is not `application/x-ndjson` (`content-type: {}`)",
+                    content_type
+                ));
+            }
+
+            // Stream response from HTTP body using newline-delimited format
+            let lines_stream = Self::parse_ndjson_stream(response);
+            Ok(RequestResponseChannel::HTTPResponseBody(lines_stream))
+        } else {
+            // Server doesn't support bidi streaming, use TCP callback as before
+            let response_body = response.bytes().await?;
+            Ok(RequestResponseChannel::TCPCallback(response_body))
+        }
     }
 
     fn transport_name(&self) -> &'static str {

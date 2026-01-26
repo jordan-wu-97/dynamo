@@ -6,7 +6,7 @@
 //! Wraps the NATS client to implement the unified RequestPlaneClient trait,
 //! providing a consistent interface across all transport types.
 
-use super::unified_client::{ClientStats, Headers, RequestPlaneClient};
+use super::unified_client::{ClientStats, Headers, RequestPlaneClient, RequestResponseChannel};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -37,7 +37,7 @@ impl RequestPlaneClient for NatsRequestClient {
         address: String,
         payload: Bytes,
         headers: Headers,
-    ) -> Result<Bytes> {
+    ) -> Result<RequestResponseChannel> {
         // Convert generic headers to NATS headers
         let mut nats_headers = async_nats::HeaderMap::new();
         for (key, value) in headers {
@@ -51,7 +51,8 @@ impl RequestPlaneClient for NatsRequestClient {
             .await
             .map_err(|e| anyhow::anyhow!("NATS request failed: {}", e))?;
 
-        Ok(response.payload)
+        // Always use TCP callback (no bidi support for NATS transport)
+        Ok(RequestResponseChannel::TcpCallback(response.payload))
     }
 
     fn transport_name(&self) -> &'static str {

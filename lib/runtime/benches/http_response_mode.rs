@@ -32,6 +32,8 @@ use dynamo_runtime::{
     },
 };
 use futures::StreamExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::io::StreamReader;
 use hyper_util::{
     rt::TokioExecutor,
     server::conn::auto::Builder as ConnBuilder,
@@ -423,28 +425,22 @@ async fn run_bidi_iteration(
         .map(|v| v == "true")
         .unwrap_or(false));
 
-    // Parse ndjson stream
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let stream = response
+        .bytes_stream()
+        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let reader = StreamReader::new(stream);
+    let mut lines = FramedRead::new(reader, LinesCodec::new());
     let mut count = 0;
 
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.unwrap();
-        buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-        // Process complete lines
-        while let Some(newline_pos) = buffer.find('\n') {
-            let line = buffer[..newline_pos].to_string();
-            buffer = buffer[newline_pos + 1..].to_string();
-
-            if !line.is_empty() {
-                let wrapper: NetworkStreamWrapper<BenchResponse> =
-                    serde_json::from_str(&line).unwrap();
-                if wrapper.complete_final {
-                    return count;
-                }
-                count += 1;
+    while let Some(result) = lines.next().await {
+        let line = result.unwrap();
+        if !line.is_empty() {
+            let wrapper: NetworkStreamWrapper<BenchResponse> =
+                serde_json::from_str(&line).unwrap();
+            if wrapper.complete_final {
+                return count;
             }
+            count += 1;
         }
     }
 

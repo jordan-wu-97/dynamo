@@ -7,13 +7,29 @@
 //! in the request plane. All transport implementations (TCP, HTTP, NATS)
 //! implement this trait to provide a consistent interface for the egress router.
 
+use crate::engine::AsyncEngineContext;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::Stream;
 use std::collections::HashMap;
+use std::pin::Pin;
+use tokio_stream::StreamExt;
 
 /// Type alias for request headers
 pub type Headers = HashMap<String, String>;
+
+/// Stream of response bytes for bidirectional streaming
+pub type ResponseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
+
+pub enum RequestResponseChannel {
+    /// expect the worker to create a new TCP connection back to the router.
+    /// todo: doesn't seem like the bytes response is used for anything in AddressedPushRouter, maybe get rid of it
+    TcpCallback(Bytes),
+    /// expect the worker to respond on the same bidirectional stream as the request.
+    /// AddressedPushRouter will parse the response stream into the typed responses.
+    DirectResponse(ResponseByteStream),
+}
 
 /// Unified interface for request plane clients
 ///
@@ -76,7 +92,7 @@ pub trait RequestPlaneClient: Send + Sync {
         address: String,
         payload: Bytes,
         headers: Headers,
-    ) -> Result<Bytes>;
+    ) -> Result<RequestResponseChannel>;
 
     /// Get the transport name
     ///

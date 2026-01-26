@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::pin::Pin;
 use std::sync::Arc;
 
-use super::unified_client::RequestPlaneClient;
+use super::unified_client::{RequestPlaneClient, RequestResponseChannel, ResponseByteStream};
 use super::*;
 use crate::engine::{AsyncEngine, AsyncEngineContextProvider, Data};
 use crate::logging::inject_trace_headers_into_map;
@@ -167,18 +168,28 @@ where
         inject_trace_headers_into_map(&mut headers);
 
         // Send request (works for all transport types)
-        let _response = self
+        let response = self
             .req_client
             .send_request(address, buffer, headers)
             .await?;
 
-        tracing::trace!(request_id, "awaiting transport handshake");
-        let response_stream = response_stream_provider
-            .await
-            .map_err(|_| PipelineError::DetachedStreamReceiver)?
-            .map_err(PipelineError::ConnectionFailed)?;
+        let rx_stream: ResponseByteStream = match response {
+            RequestResponseChannel::TcpCallback(_) => {
+                tracing::trace!(request_id, "awaiting transport handshake");
 
-        let rx_stream = ReceiverStream::new(response_stream.rx);
+                let response_stream = response_stream_provider
+                    .await
+                    .map_err(|_| PipelineError::DetachedStreamReceiver)?
+                    .map_err(PipelineError::ConnectionFailed)?;
+
+                Box::pin(ReceiverStream::new(response_stream.rx).map(anyhow::Ok))
+            }
+            RequestResponseChannel::DirectResponse(bytes_stream) => {
+                // todo: need to drop the registration from tcp server
+                bytes_stream
+            }
+        };
+
         let stream = Self::parse_response_stream::<U, _>(rx_stream, engine_ctx.clone());
 
         Ok(ResponseStream::new(Box::pin(stream), engine_ctx))
@@ -192,7 +203,7 @@ impl AddressedPushRouter {
     ) -> impl Stream<Item = U>
     where
         U: for<'de> Deserialize<'de> + MaybeError + 'static,
-        S: Stream<Item = Bytes> + 'static,
+        S: Stream<Item = Result<Bytes>> + 'static,
     {
         let res_stream = async_stream::try_stream!({
             tokio::pin!(rx_stream);
@@ -210,14 +221,19 @@ impl AddressedPushRouter {
                     res = rx_stream.next() => res
                 };
 
-                let Some(res_bytes) = res else {
-                    // stream ended, received confirmation
-                    if is_complete_final {
+                let res_bytes = match res {
+                    Some(Ok(res_bytes)) => res_bytes,
+                    Some(Err(err)) => {
+                        tracing::debug!(%err, "Failed receiving response from request plane");
+                        break 'evt Err(err);
+                    }
+                    None if is_complete_final => {
                         break 'evt Ok(());
                     }
-                    // stream ended unexpectedly, have not received confirmation
-                    tracing::debug!("{STREAM_ERR_MSG}");
-                    break 'evt Err(Error::msg(STREAM_ERR_MSG));
+                    None => {
+                        tracing::debug!("{STREAM_ERR_MSG}");
+                        break 'evt Err(Error::msg(STREAM_ERR_MSG));
+                    }
                 };
 
                 if is_complete_final {

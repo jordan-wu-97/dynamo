@@ -4,7 +4,9 @@
 //! TCP Request Plane Client
 //!
 
-use super::unified_client::{ClientStats, Headers, RequestPlaneClient};
+use super::unified_client::{
+    ClientStats, Headers, RequestPlaneClient, RequestResponseChannel, ResponseByteStream,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -495,9 +497,8 @@ impl Default for TcpRequestClient {
     }
 }
 
-#[async_trait]
-impl RequestPlaneClient for TcpRequestClient {
-    async fn send_request(
+impl TcpRequestClient {
+    async fn _send_request(
         &self,
         address: String,
         payload: Bytes,
@@ -554,6 +555,23 @@ impl RequestPlaneClient for TcpRequestClient {
                 Err(anyhow::anyhow!("TCP request timeout to {}", addr))
             }
         }
+    }
+}
+
+#[async_trait]
+impl RequestPlaneClient for TcpRequestClient {
+    async fn send_request(
+        &self,
+        address: String,
+        payload: Bytes,
+        headers: Headers,
+    ) -> Result<RequestResponseChannel> {
+        // TCP transport does not support bidi streaming
+        // Send the request and use TCP callback for response
+        let response = self._send_request(address, payload, headers).await?;
+
+        // Always use TCP callback (no bidi support for TCP transport)
+        Ok(RequestResponseChannel::TcpCallback(response))
     }
 
     fn transport_name(&self) -> &'static str {

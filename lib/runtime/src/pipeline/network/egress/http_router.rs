@@ -3,12 +3,17 @@
 
 //! HTTP/2 client for request plane
 
-use super::unified_client::{Headers, RequestPlaneClient};
+use super::unified_client::{Headers, RequestPlaneClient, ResponseByteStream};
 use crate::Result;
+use crate::pipeline::network::egress::unified_client::RequestResponseChannel;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::io::StreamReader;
 
 /// Default timeout for HTTP requests (ack only, not full response)
 const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -152,6 +157,30 @@ impl HttpRequestClient {
     pub fn config(&self) -> &Http2Config {
         &self.config
     }
+
+    fn parse_ndjson_stream(http_response: reqwest::Response) -> ResponseByteStream {
+        // 1. Convert reqwest stream to a Stream<Item = io::Result<Bytes>>
+        // StreamReader requires the error type to be std::io::Error
+        let stream = http_response
+            .bytes_stream()
+            .map_err(std::io::Error::other);
+
+        // 2. Convert the Stream into an AsyncRead
+        let reader = StreamReader::new(stream);
+
+        // 3. Wrap the reader in a FramedRead using LinesCodec
+        // This handles buffering and splitting by '\n' or '\r\n'
+        let framed = FramedRead::new(reader, LinesCodec::new());
+
+        // 4. Map the stream of Strings back to Result<Bytes>
+        // Note: LinesCodec strips the newline characters and validates UTF-8
+        let output_stream = framed.map(|item| match item {
+            Ok(line) => Ok(Bytes::from(line)),
+            Err(e) => Err(anyhow::Error::from(e)),
+        });
+
+        Box::pin(output_stream)
+    }
 }
 
 impl Default for HttpRequestClient {
@@ -166,8 +195,11 @@ impl RequestPlaneClient for HttpRequestClient {
         &self,
         address: String,
         payload: Bytes,
-        headers: Headers,
-    ) -> Result<Bytes> {
+        mut headers: Headers,
+    ) -> Result<RequestResponseChannel> {
+        // Signal to the server that we support bidi streaming
+        headers.insert("x-dynamo-accept-bidi-stream".to_string(), "true".to_string());
+
         let mut req = self
             .client
             .post(&address)
@@ -189,8 +221,39 @@ impl RequestPlaneClient for HttpRequestClient {
             );
         }
 
-        let body = response.bytes().await?;
-        Ok(body)
+        // Check if server supports bidi streaming via response header
+        let is_bidi = response
+            .headers()
+            .get("x-dynamo-bidi-stream")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        if is_bidi {
+            // check if the response is newline-delimited JSON
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            let is_nd_json = content_type.contains("application/x-ndjson");
+
+            if !is_nd_json {
+                return Err(anyhow::anyhow!(
+                    "backend responded with `x-dynamo-bidi-stream: true` header but content-type is not `application/x-ndjson` (`content-type: {}`)",
+                    content_type
+                ));
+            }
+
+            // Stream response from HTTP body using newline-delimited format
+            let lines_stream = Self::parse_ndjson_stream(response);
+            Ok(RequestResponseChannel::DirectResponse(lines_stream))
+        } else {
+            // Server doesn't support bidi streaming, use TCP callback as before
+            let response_body = response.bytes().await?;
+            Ok(RequestResponseChannel::TcpCallback(response_body))
+        }
     }
 
     fn transport_name(&self) -> &'static str {
@@ -689,6 +752,302 @@ mod tests {
         assert!(throughput_mbps > 10.0); // At least 10 MB/s throughput
 
         // Cleanup
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_bidi_mode_switching() {
+        use axum::{
+            body::Body,
+            http::{Response, StatusCode},
+            response::IntoResponse,
+        };
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder as ConnBuilder;
+        use hyper_util::service::TowerToHyperService;
+
+        /// Handler that returns a non-bidi response (no x-dynamo-bidi-stream header)
+        async fn non_bidi_handler() -> impl IntoResponse {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .body(Body::from("callback-address:12345"))
+                .unwrap()
+        }
+
+        /// Handler that returns a valid bidi response with ndjson content
+        async fn bidi_handler() -> impl IntoResponse {
+            // Generate proper JSON lines using serde_json
+            let lines = vec![
+                serde_json::json!({"id": 1, "message": "first"}),
+                serde_json::json!({"id": 2, "message": "second"}),
+                serde_json::json!({"id": 3, "message": "third"}),
+            ];
+            let body = lines
+                .iter()
+                .map(|v| serde_json::to_string(v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("x-dynamo-bidi-stream", "true")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        /// Handler that returns bidi header but wrong content-type (should error)
+        async fn bidi_wrong_content_type_handler() -> impl IntoResponse {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("x-dynamo-bidi-stream", "true")
+                .header("content-type", "text/plain")
+                .body(Body::from("some text"))
+                .unwrap()
+        }
+
+        // Test 1: Non-bidi mode (TcpCallback)
+        {
+            let app = Router::new().route("/test", post(non_bidi_handler));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server_handle = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        let conn_builder = ConnBuilder::new(TokioExecutor::new());
+                        let io = TokioIo::new(stream);
+                        let tower_service = app.into_service();
+                        let hyper_service = TowerToHyperService::new(tower_service);
+                        let _ = conn_builder.serve_connection(io, hyper_service).await;
+                    });
+                }
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let client = HttpRequestClient::new().unwrap();
+            let result = client
+                .send_request(
+                    format!("http://{}/test", addr),
+                    Bytes::from("test"),
+                    std::collections::HashMap::new(),
+                )
+                .await;
+
+            assert!(result.is_ok(), "Non-bidi request should succeed");
+            match result.unwrap() {
+                RequestResponseChannel::TcpCallback(bytes) => {
+                    assert_eq!(bytes, Bytes::from("callback-address:12345"));
+                }
+                RequestResponseChannel::DirectResponse(_) => {
+                    panic!("Expected TcpCallback but got DirectResponse");
+                }
+            }
+
+            server_handle.abort();
+        }
+
+        // Test 2: Bidi mode with valid ndjson (DirectResponse)
+        {
+            let app = Router::new().route("/test", post(bidi_handler));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server_handle = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        let conn_builder = ConnBuilder::new(TokioExecutor::new());
+                        let io = TokioIo::new(stream);
+                        let tower_service = app.into_service();
+                        let hyper_service = TowerToHyperService::new(tower_service);
+                        let _ = conn_builder.serve_connection(io, hyper_service).await;
+                    });
+                }
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let client = HttpRequestClient::new().unwrap();
+            let result = client
+                .send_request(
+                    format!("http://{}/test", addr),
+                    Bytes::from("test"),
+                    std::collections::HashMap::new(),
+                )
+                .await;
+
+            assert!(result.is_ok(), "Bidi request should succeed");
+            match result.unwrap() {
+                RequestResponseChannel::DirectResponse(mut stream) => {
+                    // Consume the stream and deserialize JSON
+                    let mut parsed: Vec<serde_json::Value> = vec![];
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(bytes) => {
+                                let json: serde_json::Value =
+                                    serde_json::from_slice(&bytes).expect("valid JSON");
+                                parsed.push(json);
+                            }
+                            Err(e) => panic!("Stream error: {}", e),
+                        }
+                    }
+                    // Verify deserialized content matches expected values
+                    assert_eq!(parsed.len(), 3);
+                    assert_eq!(parsed[0]["id"], 1);
+                    assert_eq!(parsed[0]["message"], "first");
+                    assert_eq!(parsed[1]["id"], 2);
+                    assert_eq!(parsed[1]["message"], "second");
+                    assert_eq!(parsed[2]["id"], 3);
+                    assert_eq!(parsed[2]["message"], "third");
+                }
+                RequestResponseChannel::TcpCallback(_) => {
+                    panic!("Expected DirectResponse but got TcpCallback");
+                }
+            }
+
+            server_handle.abort();
+        }
+
+        // Test 3: Bidi header with wrong content-type (should error)
+        {
+            let app = Router::new().route("/test", post(bidi_wrong_content_type_handler));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server_handle = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        let conn_builder = ConnBuilder::new(TokioExecutor::new());
+                        let io = TokioIo::new(stream);
+                        let tower_service = app.into_service();
+                        let hyper_service = TowerToHyperService::new(tower_service);
+                        let _ = conn_builder.serve_connection(io, hyper_service).await;
+                    });
+                }
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let client = HttpRequestClient::new().unwrap();
+            let result = client
+                .send_request(
+                    format!("http://{}/test", addr),
+                    Bytes::from("test"),
+                    std::collections::HashMap::new(),
+                )
+                .await;
+
+            match result {
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    assert!(
+                        error_msg.contains("x-dynamo-bidi-stream")
+                            && error_msg.contains("application/x-ndjson"),
+                        "Error should mention bidi header and expected content type, got: {}",
+                        error_msg
+                    );
+                }
+                Ok(_) => panic!("Bidi with wrong content-type should fail"),
+            }
+
+            server_handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bidi_request_header_sent() {
+        use axum::{
+            body::Body,
+            http::{HeaderMap, Response, StatusCode},
+            response::IntoResponse,
+        };
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder as ConnBuilder;
+        use hyper_util::service::TowerToHyperService;
+
+        #[derive(Clone)]
+        struct HeaderCapture {
+            captured: Arc<TokioMutex<Option<String>>>,
+        }
+
+        async fn capture_handler(
+            AxumState(state): AxumState<HeaderCapture>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            // Capture the x-dynamo-accept-bidi-stream header
+            let bidi_header = headers
+                .get("x-dynamo-accept-bidi-stream")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            *state.captured.lock().await = bidi_header;
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from("OK"))
+                .unwrap()
+        }
+
+        let state = HeaderCapture {
+            captured: Arc::new(TokioMutex::new(None)),
+        };
+
+        let app = Router::new()
+            .route("/test", post(capture_handler))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let conn_builder = ConnBuilder::new(TokioExecutor::new());
+                    let io = TokioIo::new(stream);
+                    let tower_service = app.into_service();
+                    let hyper_service = TowerToHyperService::new(tower_service);
+                    let _ = conn_builder.serve_connection(io, hyper_service).await;
+                });
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = HttpRequestClient::new().unwrap();
+        let _ = client
+            .send_request(
+                format!("http://{}/test", addr),
+                Bytes::from("test"),
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        // Verify client sent the accept-bidi-stream header
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let captured = state.captured.lock().await;
+        assert_eq!(
+            *captured,
+            Some("true".to_string()),
+            "Client should send x-dynamo-accept-bidi-stream: true header"
+        );
+
         server_handle.abort();
     }
 }

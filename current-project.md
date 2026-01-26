@@ -14,11 +14,9 @@ Enable `AddressedPushRouter` to receive responses over HTTP/2 response body (new
 
 ```rust
 impl TcpStreamServer {
-    /// Deregister a pending response stream by subject
-    /// Called when bidi streaming is used instead of TCP callback
-    pub async fn deregister(&self, subject: &str) {
-        let mut state = self.state.lock().await;
-        state.rx_subjects.remove(subject);
+    /// Deregister a pending response stream by connection_info
+    pub async fn deregister_response_stream(&self, connection_info: &TcpStreamConnectionInfo) {
+        // deregister the stream
     }
 }
 ```
@@ -37,6 +35,18 @@ pub struct StreamContext {
     pub tcp_server: Arc<TcpStreamServer>,
     /// Pre-registered pending connection (registration happens before send)
     pub pending_recv_stream: RegisteredStream<StreamReceiver>,
+}
+
+impl Drop for StreamContext {
+    fn drop(&mut self) {
+        // deregister
+    }
+}
+
+impl StreamContext {
+    pub fn await_transport_handshake(&self) -> Result<ResponseByteStream> {
+        // await the transport handshake
+    }
 }
 
 #[async_trait]
@@ -138,11 +148,9 @@ impl RequestPlaneClient for TcpRequestClient {
 
         // Always use TCP callback (no bidi support)
         let (_, response_stream_provider) = stream_context.pending_recv_stream.into_parts();
-        let response_stream = response_stream_provider.await
-            .map_err(|_| PipelineError::DetachedStreamReceiver)?
-            .map_err(PipelineError::ConnectionFailed)?;
+        let response_stream = stream_context.await_transport_handshake()?;
 
-        Ok(Box::pin(ReceiverStream::new(response_stream.rx).map(Ok)))
+        Ok(response_stream)
     }
 }
 ```
@@ -151,62 +159,25 @@ impl RequestPlaneClient for TcpRequestClient {
 
 ```rust
 async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error> {
-    // ... extract request, address, engine_ctx ...
+    /// ... keep similar logic as before
 
-    // 1. Register with TCP server FIRST (unchanged)
-    let options = StreamOptions::builder()
-        .context(engine_ctx.clone())
-        .enable_request_stream(false)
-        .enable_response_stream(true)
-        .build()?;
-
-    let pending_connections = self.resp_transport.register(options).await;
-    let pending_recv_stream = match pending_connections.into_parts() {
-        (None, Some(recv)) => recv,
-        _ => panic!("Invalid registration"),
-    };
-
-    // 2. Get connection_info for control message (unchanged)
-    let connection_info = pending_recv_stream.connection_info.clone();
-
-    // 3. Build control message with connection_info (unchanged)
-    let control_message = RequestControlMessage { ... connection_info ... };
-    let buffer = /* encode as before */;
-
-    // 4. Build stream context with pre-registered pending connection
+    // Build stream context with pre-registered pending connection
     let stream_context = StreamContext {
         engine_context: engine_ctx.clone(),
         tcp_server: self.resp_transport.clone(),
         pending_recv_stream,
     };
 
-    // 5. Send request via streaming API
+    // Send request via streaming API
     let response_stream = self.req_client
         .send_request_streaming(address, buffer, headers, stream_context)
         .await?;
 
-    // 6. Process stream (unchanged - same NetworkStreamWrapper<U> decoding)
-    let stream = response_stream.filter_map(move |res| {
-        match res {
-            Ok(bytes) => /* deserialize NetworkStreamWrapper<U> as before */,
-            Err(e) => Some(U::from_err(e.into())),
-        }
-    });
+    // ... keep similar logic as before, but use the response_stream
 
     Ok(ResponseStream::new(Box::pin(stream), engine_ctx))
 }
 ```
-
-## Files to Modify
-
-| File | Changes |
-|------|---------|
-| `lib/runtime/src/pipeline/network/tcp/server.rs` | Add `deregister()` method |
-| `lib/runtime/src/pipeline/network/egress/unified_client.rs` | Add `ResponseByteStream`, `StreamContext`, `send_request_streaming` |
-| `lib/runtime/src/pipeline/network/egress/http_router.rs` | Implement bidi streaming (use `LinesCodec`) |
-| `lib/runtime/src/pipeline/network/egress/addressed_router.rs` | Use `send_request_streaming`, pass pre-registered connection |
-| `lib/runtime/src/pipeline/network/egress/tcp_client.rs` | Implement `send_request_streaming` (use TCP callback) |
-| `lib/runtime/src/pipeline/network/egress/nats_client.rs` | Implement `send_request_streaming` (use TCP callback) |
 
 ## Protocol Flow
 
@@ -236,9 +207,6 @@ Newline-delimited JSON, each line is a `NetworkStreamWrapper<U>`:
 {"data": null, "complete_final": true}\n
 ```
 
-## Verification
+## Integration Tests
 
-1. **Integration tests**:
-    - HTTP bidi: server returns `x-bidi-stream: true`, verify deregister called
-    - HTTP fallback: server without header, verify TCP callback used
-2. **Regression tests**: TCP and NATS transports unchanged behavior
+- Create a mock HTTP server that interacts with the updated `AddressedPushRouter` and `HttpRequestClient` when `x-bidi-stream: true`
